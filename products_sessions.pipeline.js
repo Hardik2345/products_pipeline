@@ -654,9 +654,41 @@ async function runPipeline() {
   console.log(`\n✅ All brands completed.\n`);
 }
 
+let running = false;
+
+async function safeRun(trigger = "unknown") {
+  if (running) {
+    console.log(`[SCHED] Skipping run (${trigger}) because previous run is still running.`);
+    return;
+  }
+
+  running = true;
+  const startedAt = fmtIST();
+  console.log(`\n[SCHED] Starting pipeline (${trigger}) @ ${startedAt}\n`);
+
+  try {
+    await runPipeline();
+    console.log(`\n[SCHED] Pipeline completed (${trigger}) @ ${fmtIST()}\n`);
+  } catch (err) {
+    console.error(`[SCHED] Pipeline crashed (${trigger}) @ ${fmtIST()}:`, err);
+  } finally {
+    running = false;
+  }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  runPipeline().catch((err) => {
-    console.error('Pipeline crashed:', err);
-    process.exit(1);
-  });
+  // 1) Run immediately on deployment/startup
+  safeRun("startup");
+
+  // 2) Cron: run at the start of each hour (minute 0, second 0) in Asia/Kolkata
+  cron.schedule(
+    "0 0 * * * *",           // second minute hour day month weekday
+    () => safeRun("hourly"),
+    {
+      timezone: "Asia/Kolkata",
+    }
+  );
+
+  console.log(`[SCHED] Cron enabled: runs at start of every hour (Asia/Kolkata).`);
+  console.log(`[SCHED] Service started @ ${fmtIST()}`);
 }
