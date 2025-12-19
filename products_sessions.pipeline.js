@@ -1,6 +1,21 @@
-import 'dotenv/config';
-import mysql from 'mysql2/promise';
-import axios from 'axios';
+/**
+ * Product Sessions ETL Pipeline (with Backfill + Hourly Summary)
+ *
+ * Normal mode (hourly cron):
+ *   BACKFILL_MODE=false (or unset)
+ *
+ * Backfill mode (runs once on startup, cron disabled):
+ *   BACKFILL_MODE=true
+ *   BACKFILL_START_IST_DATE=2025-10-01
+ *   BACKFILL_END_IST_DATE=2025-12-14
+ *
+ * Optional:
+ *   SHOPIFYQL_TIMEZONE=Asia/Kolkata   (default)
+ */
+
+import "dotenv/config";
+import mysql from "mysql2/promise";
+import axios from "axios";
 import cron from "node-cron";
 
 // ---------- Time helpers ----------
@@ -15,11 +30,11 @@ function nowIST() {
 function fmtIST() {
   const d = nowIST();
   const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}+05:30`;
 }
 
@@ -30,14 +45,68 @@ function todayISTDate() {
 
 function fmtDate(d) {
   const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function todayISTYMD() {
+  return fmtDate(todayISTDate());
+}
+
+// ---------- Backfill env ----------
+const BACKFILL_MODE = String(process.env.BACKFILL_MODE || "")
+  .toLowerCase()
+  .trim() === "true";
+const BACKFILL_START_IST_DATE = process.env.BACKFILL_START_IST_DATE; // YYYY-MM-DD
+const BACKFILL_END_IST_DATE = process.env.BACKFILL_END_IST_DATE; // YYYY-MM-DD
+const SHOPIFYQL_TIMEZONE = process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
+
+// ---------- Date-range helpers (safe iteration using UTC) ----------
+function isValidYMD(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function ymdToUTCDate(ymd) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+
+function fmtUTCDateToYMD(dt) {
+  const y = dt.getUTCFullYear();
+  const m = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(dt.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function addDaysUTC(dt, days) {
+  return new Date(dt.getTime() + days * 86400000);
+}
+
+function buildInclusiveDateRangeYMD(startYmd, endYmd) {
+  if (!isValidYMD(startYmd) || !isValidYMD(endYmd)) {
+    throw new Error(
+      `[BACKFILL] Invalid date format. Expected YYYY-MM-DD for BACKFILL_START_IST_DATE/BACKFILL_END_IST_DATE. Got start=${startYmd}, end=${endYmd}`
+    );
+  }
+
+  const start = ymdToUTCDate(startYmd);
+  const end = ymdToUTCDate(endYmd);
+
+  if (start.getTime() > end.getTime()) {
+    throw new Error(`[BACKFILL] Start date is after end date: ${startYmd} > ${endYmd}`);
+  }
+
+  const out = [];
+  for (let cur = start; cur.getTime() <= end.getTime(); cur = addDaysUTC(cur, 1)) {
+    out.push(fmtUTCDateToYMD(cur));
+  }
+  return out;
 }
 
 // ---------- Brand config ----------
 function loadBrands() {
-  const count = parseInt(process.env.TOTAL_CONFIG_COUNT || '0', 10);
+  const count = parseInt(process.env.TOTAL_CONFIG_COUNT || "0", 10);
   console.log(`[INIT] Loading ${count} brands...`);
 
   const brands = [];
@@ -79,17 +148,27 @@ function loadBrands() {
       accessToken,
       dbDatabase,
       pool,
+      _tablesEnsured: false,
     });
 
     console.log(`[INIT] Brand[${i}] ${brandName} ready (shop=${shopName}, db=${dbDatabase})`);
   }
 
-  console.log(`[INIT] Active brands: ${brands.map((b) => `${b.index}:${b.name}`).join(', ')}`);
+  console.log(`[INIT] Active brands: ${brands.map((b) => `${b.index}:${b.name}`).join(", ")}`);
   return brands;
+}
+
+// Reuse pools across runs
+let _BRANDS = null;
+function getBrands() {
+  if (!_BRANDS) _BRANDS = loadBrands();
+  return _BRANDS;
 }
 
 // ---------- DB Setup ----------
 async function ensureTablesForBrand(brand) {
+  if (brand._tablesEnsured) return;
+
   const conn = await brand.pool.getConnection();
   try {
     await conn.query(`
@@ -130,6 +209,7 @@ async function ensureTablesForBrand(brand) {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
+    // Note: includes add_to_cart_rate_pct because your INSERT uses it
     await conn.query(`
       CREATE TABLE IF NOT EXISTS mv_product_sessions_by_path_daily (
         date DATE NOT NULL,
@@ -138,6 +218,7 @@ async function ensureTablesForBrand(brand) {
         sessions INT NOT NULL DEFAULT 0,
         sessions_with_cart_additions INT NOT NULL DEFAULT 0,
         add_to_cart_rate DECIMAL(6,4) NOT NULL DEFAULT 0,
+        add_to_cart_rate_pct DECIMAL(7,4) NOT NULL DEFAULT 0,
         conversion_rate_pct DECIMAL(7,4) NOT NULL DEFAULT 0,
         PRIMARY KEY (date, landing_page_path(200)),
         KEY idx_date (date),
@@ -161,9 +242,11 @@ async function ensureTablesForBrand(brand) {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
+    // Note: includes landing_page_path because your INSERT uses it
     await conn.query(`
       CREATE TABLE IF NOT EXISTS mv_product_sessions_by_campaign_daily (
         date DATE NOT NULL,
+        landing_page_path VARCHAR(500) NOT NULL,
         utm_campaign VARCHAR(255) NOT NULL,
         product_id   VARCHAR(50)  DEFAULT NULL,
         referrer_name VARCHAR(255) DEFAULT NULL,
@@ -171,7 +254,7 @@ async function ensureTablesForBrand(brand) {
         sessions_with_cart_additions INT NOT NULL DEFAULT 0,
         add_to_cart_rate_pct   DECIMAL(7,4) NOT NULL DEFAULT 0,
         conversion_rate_pct    DECIMAL(7,4) NOT NULL DEFAULT 0,
-        PRIMARY KEY (date, utm_campaign, product_id, referrer_name(100)),
+        PRIMARY KEY (date, utm_campaign, landing_page_path(200), product_id, referrer_name(100)),
         KEY idx_date      (date),
         KEY idx_campaign  (utm_campaign),
         KEY idx_product   (product_id),
@@ -185,6 +268,21 @@ async function ensureTablesForBrand(brand) {
         key_value VARCHAR(255) NULL
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    // Hourly summary table (your requested target)
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS hourly_sessions_summary_shopify (
+        date DATE NOT NULL,
+        hour TINYINT UNSIGNED NOT NULL,
+        number_of_sessions INT DEFAULT 0,
+        number_of_atc_sessions INT DEFAULT 0,
+        adjusted_number_of_sessions INT NULL,
+        PRIMARY KEY (date, hour),
+        KEY idx_date (date)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    brand._tablesEnsured = true;
   } finally {
     conn.release();
   }
@@ -235,14 +333,14 @@ async function syncProductsForBrand(brand) {
 
       const resp = await axios.get(url, {
         headers: {
-          'X-Shopify-Access-Token': brand.accessToken,
-          'Content-Type': 'application/json',
+          "X-Shopify-Access-Token": brand.accessToken,
+          "Content-Type": "application/json",
         },
         validateStatus: () => true,
       });
 
       if (resp.status === 429) {
-        const retry = Number(resp.headers['retry-after'] || '3');
+        const retry = Number(resp.headers["retry-after"] || "3");
         console.log(`[${brand.tag}] Rate-limited, sleeping ${retry}s`);
         await new Promise((r) => setTimeout(r, retry * 1000));
         continue;
@@ -256,15 +354,10 @@ async function syncProductsForBrand(brand) {
       const products = resp.data.products || [];
       if (!products.length) break;
 
-      const rows = products.map((p) => [
-        p.id,
-        `/products/${p.handle}`,
-        p.status || null,
-        p.title || null,
-      ]);
+      const rows = products.map((p) => [p.id, `/products/${p.handle}`, p.status || null, p.title || null]);
 
       if (rows.length) {
-        const placeholders = rows.map(() => '(?, ?, ?, ?)').join(', ');
+        const placeholders = rows.map(() => "(?, ?, ?, ?)").join(", ");
         await conn.query(
           `
           INSERT INTO product_landing_mapping (product_id, landing_page_path, status, title)
@@ -284,7 +377,7 @@ async function syncProductsForBrand(brand) {
       if (!link) {
         url = null;
       } else {
-        const nextPart = link.split(',').find((l) => l.includes('rel="next"'));
+        const nextPart = link.split(",").find((l) => l.includes('rel="next"'));
         if (!nextPart) {
           url = null;
         } else {
@@ -304,8 +397,42 @@ async function syncProductsForBrand(brand) {
   }
 }
 
-// ---------- ShopifyQL ----------
-function buildShopifyQLQuery() {
+// ---------- ShopifyQL helpers ----------
+function formatShopifyQLTable(tableData) {
+  const columns = tableData.columns || [];
+  const rows = tableData.rows || [];
+  const out = [];
+
+  for (const row of rows) {
+    // NEW STYLE (object rows)
+    if (row && typeof row === "object" && !Array.isArray(row)) {
+      out.push({ ...row });
+      continue;
+    }
+
+    // LEGACY STYLE (array rows)
+    if (Array.isArray(row)) {
+      const obj = {};
+      row.forEach((val, idx) => {
+        if (columns[idx]) obj[columns[idx].name] = val;
+      });
+      out.push(obj);
+    }
+  }
+
+  return out;
+}
+
+function buildDayClause(targetYmd) {
+  // Avoid "future UNTIL" for today; use DURING today for current day runs.
+  if (!targetYmd || targetYmd === todayISTYMD()) return `DURING today`;
+  return `SINCE ${targetYmd}T00:00:00 UNTIL ${targetYmd}T23:59:59`;
+}
+
+function buildShopifyQLQuery(targetYmd = null) {
+  const dayClause = buildDayClause(targetYmd);
+  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+
   return `
     FROM sessions
       SHOW
@@ -330,78 +457,113 @@ function buildShopifyQLQuery() {
         utm_content,
         utm_term,
         referrer_name
-      DURING today
+      ${tzClause}
+      ${dayClause}
       ORDER BY sessions DESC
       LIMIT 1000
     VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
-  `.replace(/\n+/g, ' ');
+  `.replace(/\n+/g, " ");
 }
 
-function formatShopifyQLTable(tableData) {
-  const columns = tableData.columns || [];
-  const rows = tableData.rows || [];
-  const out = [];
-
-  for (const row of rows) {
-    // Case 1: NEW STYLE (object rows)
-    if (row && typeof row === 'object' && !Array.isArray(row)) {
-      out.push({ ...row });
-      continue;
-    }
-
-    // Case 2: LEGACY STYLE (array rows)
-    if (Array.isArray(row)) {
-      const obj = {};
-      row.forEach((val, idx) => {
-        if (columns[idx]) {
-          obj[columns[idx].name] = val;
-        }
-      });
-      out.push(obj);
-      continue;
-    }
-  }
-
-  return out;
-}
-
-async function fetchShopifyQLSessions(brand) {
+async function fetchShopifyQLSessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
-  const q = buildShopifyQLQuery().replace(/"/g, '\\"');
+  const q = buildShopifyQLQuery(targetYmd).replace(/"/g, '\\"');
 
   const graphql = {
     query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
   };
 
-  const resp = await axios.post(url, graphql, {
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': brand.accessToken,
-    },
-    timeout: 60000,
-    validateStatus: () => true,
-  });
+  while (true) {
+    const resp = await axios.post(url, graphql, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": brand.accessToken,
+      },
+      timeout: 60000,
+      validateStatus: () => true,
+    });
 
-  if (resp.status !== 200 || resp.data.errors) return [];
+    if (resp.status === 429) {
+      const retry = Number(resp.headers["retry-after"] || "3");
+      console.log(`[${brand.tag}] ShopifyQL rate-limited, sleeping ${retry}s`);
+      await new Promise((r) => setTimeout(r, retry * 1000));
+      continue;
+    }
 
-  const res = resp.data.data.shopifyqlQuery;
-  if (res.parseErrors?.length) return [];
+    if (resp.status !== 200 || resp.data.errors) return [];
 
-  return formatShopifyQLTable(res.tableData);
+    const res = resp.data.data?.shopifyqlQuery;
+    if (!res || res.parseErrors?.length) return [];
+
+    return formatShopifyQLTable(res.tableData);
+  }
+}
+
+// ---------- Hourly ShopifyQL (hour_of_day) ----------
+function buildShopifyQLHourlyQuery(targetYmd = null) {
+  const dayClause = buildDayClause(targetYmd);
+  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+
+  return `
+    FROM sessions
+      SHOW
+        hour_of_day,
+        sessions,
+        sessions_with_cart_additions
+      WHERE human_or_bot_session IN ('human', 'bot')
+      GROUP BY hour_of_day
+      ${tzClause}
+      ${dayClause}
+      ORDER BY hour_of_day ASC
+      LIMIT 1000
+    VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
+  `.replace(/\n+/g, " ");
+}
+
+async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
+  const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
+  const q = buildShopifyQLHourlyQuery(targetYmd).replace(/"/g, '\\"');
+
+  const graphql = {
+    query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
+  };
+
+  while (true) {
+    const resp = await axios.post(url, graphql, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": brand.accessToken,
+      },
+      timeout: 60000,
+      validateStatus: () => true,
+    });
+
+    if (resp.status === 429) {
+      const retry = Number(resp.headers["retry-after"] || "3");
+      console.log(`[${brand.tag}] ShopifyQL hourly rate-limited, sleeping ${retry}s`);
+      await new Promise((r) => setTimeout(r, retry * 1000));
+      continue;
+    }
+
+    if (resp.status !== 200 || resp.data.errors) return [];
+
+    const res = resp.data.data?.shopifyqlQuery;
+    if (!res || res.parseErrors?.length) return [];
+
+    return formatShopifyQLTable(res.tableData);
+  }
 }
 
 // ---------- Snapshot + MV refresh ----------
-async function upsertProductSessionsSnapshot(brand, rows) {
-  const today = fmtDate(todayISTDate());
+async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
   const conn = await brand.pool.getConnection();
 
   try {
-    await conn.query(`DELETE FROM product_sessions_snapshot WHERE date=?`, [today]);
-
+    await conn.query(`DELETE FROM product_sessions_snapshot WHERE date=?`, [targetYmd]);
     if (!rows.length) return;
 
     const insertRows = rows.map((r) => [
-      today,
+      targetYmd,
       r.landing_page_type || null,
       r.landing_page_path || null,
       r.utm_source || null,
@@ -415,7 +577,7 @@ async function upsertProductSessionsSnapshot(brand, rows) {
       new Date(),
     ]);
 
-    const placeholders = insertRows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+    const placeholders = insertRows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
 
     await conn.query(
       `
@@ -439,23 +601,22 @@ async function upsertProductSessionsSnapshot(brand, rows) {
       insertRows.flat()
     );
 
-    console.log(`[${brand.name}] Inserted ${insertRows.length} rows into snapshot.`);
+    console.log(`[${brand.name}] Inserted ${insertRows.length} rows into snapshot for ${targetYmd}.`);
   } finally {
     conn.release();
   }
 }
 
-async function refreshMaterializedViews(brand) {
-  const today = fmtDate(todayISTDate());
+async function refreshMaterializedViews(brand, targetYmd) {
   const conn = await brand.pool.getConnection();
 
   try {
-    // Wipe today's rows from all MVs
-    await conn.query(`DELETE FROM mv_product_sessions_by_type_daily     WHERE date = ?`, [today]);
-    await conn.query(`DELETE FROM mv_product_sessions_by_path_daily     WHERE date = ?`, [today]);
-    await conn.query(`DELETE FROM mv_product_sessions_by_campaign_daily WHERE date = ?`, [today]);
+    // Wipe target day's rows from all MVs
+    await conn.query(`DELETE FROM mv_product_sessions_by_type_daily     WHERE date = ?`, [targetYmd]);
+    await conn.query(`DELETE FROM mv_product_sessions_by_path_daily     WHERE date = ?`, [targetYmd]);
+    await conn.query(`DELETE FROM mv_product_sessions_by_campaign_daily WHERE date = ?`, [targetYmd]);
 
-    // ---------- TYPE MV (same as before) ----------
+    // ---------- TYPE MV ----------
     await conn.query(
       `
       INSERT INTO mv_product_sessions_by_type_daily
@@ -472,10 +633,10 @@ async function refreshMaterializedViews(brand) {
       WHERE date = ?
       GROUP BY date, landing_page_type
     `,
-      [today]
+      [targetYmd]
     );
 
-    // ---------- PATH MV (product-level, with % + conversion) ----------
+    // ---------- PATH MV ----------
     await conn.query(
       `
       INSERT INTO mv_product_sessions_by_path_daily
@@ -496,21 +657,18 @@ async function refreshMaterializedViews(brand) {
         SUM(s.sessions) AS sessions,
         SUM(s.sessions_with_cart_additions) AS sessions_with_cart_additions,
 
-        -- raw ATC rate (0–1)
         CASE
           WHEN SUM(s.sessions) > 0
             THEN ROUND(SUM(s.sessions_with_cart_additions) / SUM(s.sessions), 4)
           ELSE 0
         END AS add_to_cart_rate,
 
-        -- ATC % = ATC sessions / sessions * 100
         CASE
           WHEN SUM(s.sessions) > 0
             THEN ROUND(SUM(s.sessions_with_cart_additions) / SUM(s.sessions) * 100, 4)
           ELSE 0
         END AS add_to_cart_rate_pct,
 
-        -- conversion % = orders / sessions * 100
         CASE
           WHEN SUM(s.sessions) > 0
             THEN ROUND(COALESCE(o.orders, 0) / SUM(s.sessions) * 100, 4)
@@ -542,10 +700,10 @@ async function refreshMaterializedViews(brand) {
         s.landing_page_path,
         m.product_id
     `,
-      [today, today]
+      [targetYmd, targetYmd]
     );
 
-    // ---------- CAMPAIGN MV (campaign + path + product + referrer) ----------
+    // ---------- CAMPAIGN MV ----------
     await conn.query(
       `
       INSERT INTO mv_product_sessions_by_campaign_daily
@@ -569,14 +727,12 @@ async function refreshMaterializedViews(brand) {
         SUM(s.sessions) AS sessions,
         SUM(s.sessions_with_cart_additions) AS sessions_with_cart_additions,
 
-        -- ATC % = ATC sessions / sessions * 100
         CASE
           WHEN SUM(s.sessions) > 0
             THEN ROUND(SUM(s.sessions_with_cart_additions) / SUM(s.sessions) * 100, 4)
           ELSE 0
         END AS add_to_cart_rate_pct,
 
-        -- conversion % = orders / sessions * 100
         CASE
           WHEN SUM(s.sessions) > 0
             THEN ROUND(COALESCE(o.orders, 0) / SUM(s.sessions) * 100, 4)
@@ -612,49 +768,112 @@ async function refreshMaterializedViews(brand) {
         m.product_id,
         s.referrer_name
     `,
-      [today, today]
+      [targetYmd, targetYmd]
     );
 
-    console.log(`[${brand.name}] Refreshed MVs for ${today}`);
+    console.log(`[${brand.name}] Refreshed MVs for ${targetYmd}`);
   } finally {
     conn.release();
   }
 }
 
-// ---------- Pipeline per brand ----------
-async function processBrand(brand) {
-  console.log(`\n========== ${brand.tag} ==========\n`);
+// ---------- Hourly summary upsert ----------
+async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
+  const conn = await brand.pool.getConnection();
+  try {
+    await conn.query(`DELETE FROM hourly_sessions_summary_shopify WHERE date = ?`, [targetYmd]);
+
+    const byHour = new Map();
+    for (const r of hourlyRows) {
+      const h = Number(r.hour_of_day);
+      if (!Number.isFinite(h) || h < 0 || h > 23) continue;
+      byHour.set(h, {
+        sessions: Number(r.sessions || 0),
+        atc: Number(r.sessions_with_cart_additions || 0),
+      });
+    }
+
+    const insertRows = [];
+    for (let h = 0; h < 24; h++) {
+      const v = byHour.get(h) || { sessions: 0, atc: 0 };
+      insertRows.push([targetYmd, h, v.sessions, v.atc, null]);
+    }
+
+    const placeholders = insertRows.map(() => "(?, ?, ?, ?, ?)").join(", ");
+    await conn.query(
+      `
+      INSERT INTO hourly_sessions_summary_shopify
+        (date, hour, number_of_sessions, number_of_atc_sessions, adjusted_number_of_sessions)
+      VALUES ${placeholders}
+      `,
+      insertRows.flat()
+    );
+
+    console.log(`[${brand.name}] Hourly sessions summary populated for ${targetYmd}`);
+  } finally {
+    conn.release();
+  }
+}
+
+// ---------- Pipeline per brand (date-aware) ----------
+async function processBrand(brand, targetYmd) {
+  console.log(`\n========== ${brand.tag} (${targetYmd}) ==========\n`);
 
   await ensureTablesForBrand(brand);
 
-  const today = fmtDate(todayISTDate());
+  // Product sync once per real IST day (not per backfill date)
+  const realToday = todayISTYMD();
   const lastSync = await getLastProductSyncDate(brand);
 
-  if (lastSync !== today) {
+  if (lastSync !== realToday) {
     await syncProductsForBrand(brand);
-    await setLastProductSyncDate(brand, today);
+    await setLastProductSyncDate(brand, realToday);
   } else {
-    console.log(`[${brand.tag}] Product sync already done today, skipping.`);
+    console.log(`[${brand.tag}] Product sync already done today (${realToday}), skipping.`);
   }
 
-  const rows = await fetchShopifyQLSessions(brand);
-  await upsertProductSessionsSnapshot(brand, rows);
-  await refreshMaterializedViews(brand);
+  // Main sessions snapshot + MVs
+  const rows = await fetchShopifyQLSessions(brand, targetYmd);
+  await upsertProductSessionsSnapshot(brand, rows, targetYmd);
+  await refreshMaterializedViews(brand, targetYmd);
 
-  console.log(`[${brand.tag}] Pipeline complete.`);
+  // Hourly summary
+  const hourly = await fetchShopifyQLHourlySessions(brand, targetYmd);
+  await upsertHourlySessionsSummary(brand, hourly, targetYmd);
+
+  console.log(`[${brand.tag}] Pipeline complete for ${targetYmd}.`);
 }
 
-// ---------- Main ----------
-async function runPipeline() {
-  const brands = loadBrands();
-
-  console.log(`\n🚀 Product Sessions Pipeline @ ${fmtIST()}\n`);
-
-  await Promise.all(brands.map((b) => processBrand(b)));
-
-  console.log(`\n✅ All brands completed.\n`);
+// ---------- Runners ----------
+async function runPipelineForDate(targetYmd) {
+  const brands = getBrands();
+  console.log(`\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd})\n`);
+  await Promise.all(brands.map((b) => processBrand(b, targetYmd)));
+  console.log(`\n✅ All brands completed for ${targetYmd}.\n`);
 }
 
+async function runBackfillPipeline() {
+  if (!BACKFILL_START_IST_DATE || !BACKFILL_END_IST_DATE) {
+    throw new Error(
+      `[BACKFILL] BACKFILL_MODE=true requires BACKFILL_START_IST_DATE and BACKFILL_END_IST_DATE`
+    );
+  }
+
+  const dates = buildInclusiveDateRangeYMD(BACKFILL_START_IST_DATE, BACKFILL_END_IST_DATE);
+  const brands = getBrands();
+
+  console.log(`\n🧱 Backfill mode enabled @ ${fmtIST()}`);
+  console.log(`[BACKFILL] Range: ${dates[0]} → ${dates[dates.length - 1]} (${dates.length} days)\n`);
+
+  for (const d of dates) {
+    console.log(`\n🗓️ [BACKFILL] Running for ${d} ...\n`);
+    await Promise.all(brands.map((b) => processBrand(b, d)));
+  }
+
+  console.log(`\n🏁 Backfill complete for ${dates.length} days.\n`);
+}
+
+// ---------- Scheduler wrapper ----------
 let running = false;
 
 async function safeRun(trigger = "unknown") {
@@ -668,7 +887,11 @@ async function safeRun(trigger = "unknown") {
   console.log(`\n[SCHED] Starting pipeline (${trigger}) @ ${startedAt}\n`);
 
   try {
-    await runPipeline();
+    if (BACKFILL_MODE) {
+      await runBackfillPipeline();
+    } else {
+      await runPipelineForDate(todayISTYMD());
+    }
     console.log(`\n[SCHED] Pipeline completed (${trigger}) @ ${fmtIST()}\n`);
   } catch (err) {
     console.error(`[SCHED] Pipeline crashed (${trigger}) @ ${fmtIST()}:`, err);
@@ -677,19 +900,25 @@ async function safeRun(trigger = "unknown") {
   }
 }
 
+// ---------- Main ----------
 if (import.meta.url === `file://${process.argv[1]}`) {
-  // 1) Run immediately on deployment/startup
-  safeRun("startup");
+  if (BACKFILL_MODE) {
+    // Backfill once on startup; do NOT schedule hourly cron
+    safeRun("backfill_startup");
+    console.log(`[SCHED] Backfill mode is ON; cron is disabled.`);
+    console.log(`[SCHED] Service started @ ${fmtIST()}`);
+  } else {
+    // 1) Run immediately on deployment/startup
+    safeRun("startup");
 
-  // 2) Cron: run at the start of each hour (minute 0, second 0) in Asia/Kolkata
-  cron.schedule(
-    "0 0 * * * *",           // second minute hour day month weekday
-    () => safeRun("hourly"),
-    {
-      timezone: "Asia/Kolkata",
-    }
-  );
+    // 2) Cron: run at the start of each hour (minute 0, second 0) in Asia/Kolkata
+    cron.schedule(
+      "0 0 * * * *", // second minute hour day month weekday
+      () => safeRun("hourly"),
+      { timezone: "Asia/Kolkata" }
+    );
 
-  console.log(`[SCHED] Cron enabled: runs at start of every hour (Asia/Kolkata).`);
-  console.log(`[SCHED] Service started @ ${fmtIST()}`);
+    console.log(`[SCHED] Cron enabled: runs at start of every hour (Asia/Kolkata).`);
+    console.log(`[SCHED] Service started @ ${fmtIST()}`);
+  }
 }
