@@ -17,6 +17,7 @@ import "dotenv/config";
 import mysql from "mysql2/promise";
 import axios from "axios";
 import cron from "node-cron";
+import fs from "fs";
 
 // ---------- Time helpers ----------
 const IST_OFFSET_MIN = 330; // +05:30
@@ -120,6 +121,37 @@ function loadBrands() {
     const dbUser = process.env[`DB_USER_${i}`];
     const dbPassword = process.env[`DB_PASSWORD_${i}`];
     const dbDatabase = process.env[`DB_DATABASE_${i}`];
+    const dbSslEnabledEnv = String(
+      process.env[`DB_SSL_ENABLED_${i}`] || process.env.DB_SSL_ENABLED || ""
+    ).toLowerCase();
+    let dbSslEnabled = dbSslEnabledEnv === "true";
+
+    // Default to TLS for RDS/Proxy hosts unless explicitly disabled
+    if (!dbSslEnabled && dbHost && dbSslEnabledEnv === "" && /rds\.amazonaws\.com$/i.test(dbHost)) {
+      dbSslEnabled = true;
+    }
+
+    const dbSslCa = process.env[`DB_SSL_CA_${i}`] || process.env.DB_SSL_CA;
+    const dbSslCaFile = process.env[`DB_SSL_CA_FILE_${i}`] || process.env.DB_SSL_CA_FILE;
+    let ssl;
+    if (dbSslEnabled || dbSslCa || dbSslCaFile) {
+      let ca = dbSslCa ? dbSslCa.replace(/\\n/g, "\n") : undefined;
+      if (!ca && dbSslCaFile) {
+        try {
+          ca = fs.readFileSync(dbSslCaFile, "utf8");
+        } catch (err) {
+          console.warn(
+            `[INIT] Failed to read CA file for brand ${i} (${dbSslCaFile}): ${err?.message}`
+          );
+        }
+      }
+
+      ssl = {
+        // Match "require: true, rejectUnauthorized: false" semantics used in some clients
+        rejectUnauthorized: false,
+        ...(ca ? { ca } : {}),
+      };
+    }
 
     const brandTag = process.env[`BRAND_TAG_${i}`] || `brand_${i}`;
     const brandName = process.env[`BRAND_NAME_${i}`] || brandTag.toUpperCase();
@@ -137,6 +169,7 @@ function loadBrands() {
       waitForConnections: true,
       connectionLimit: 5,
       queueLimit: 0,
+      ...(ssl ? { ssl } : {}),
     });
 
     brands.push({
@@ -678,7 +711,11 @@ async function refreshMaterializedViews(brand, targetYmd) {
       FROM product_sessions_snapshot s
 
       LEFT JOIN product_landing_mapping m
-        ON s.landing_page_path = m.landing_page_path
+        ON (
+          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
+        ) = (
+          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
+        )
 
       LEFT JOIN (
         SELECT
@@ -742,7 +779,11 @@ async function refreshMaterializedViews(brand, targetYmd) {
       FROM product_sessions_snapshot s
 
       LEFT JOIN product_landing_mapping m
-        ON s.landing_page_path = m.landing_page_path
+        ON (
+          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
+        ) = (
+          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
+        )
 
       LEFT JOIN (
         SELECT
