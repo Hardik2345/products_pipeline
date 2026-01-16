@@ -18,6 +18,8 @@ import mysql from "mysql2/promise";
 import axios from "axios";
 import cron from "node-cron";
 import fs from "fs";
+import express from "express";
+import { pathToFileURL } from "url";
 
 // ---------- Time helpers ----------
 const IST_OFFSET_MIN = 330; // +05:30
@@ -59,9 +61,10 @@ function todayISTYMD() {
 const BACKFILL_MODE = String(process.env.BACKFILL_MODE || "")
   .toLowerCase()
   .trim() === "true";
-const BACKFILL_START_IST_DATE = process.env.BACKFILL_START_IST_DATE; // YYYY-MM-DD
-const BACKFILL_END_IST_DATE = process.env.BACKFILL_END_IST_DATE; // YYYY-MM-DD
+const BACKFILL_START_IST_DATE = (process.env.BACKFILL_START_IST_DATE || process.env.BACKFILL_START_IST || "").split("T")[0]; // YYYY-MM-DD
+const BACKFILL_END_IST_DATE = (process.env.BACKFILL_END_IST_DATE || process.env.BACKFILL_END_IST || "").split("T")[0]; // YYYY-MM-DD
 const SHOPIFYQL_TIMEZONE = process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
+const TEST_MODE = process.env.TEST_MODE === "true";
 
 // ---------- Date-range helpers (safe iteration using UTC) ----------
 function isValidYMD(s) {
@@ -127,8 +130,18 @@ function loadBrands() {
     let dbSslEnabled = dbSslEnabledEnv === "true";
 
     // Default to TLS for RDS/Proxy hosts unless explicitly disabled
-    if (!dbSslEnabled && dbHost && dbSslEnabledEnv === "" && /rds\.amazonaws\.com$/i.test(dbHost)) {
+    if (
+      !dbSslEnabled &&
+      dbHost &&
+      dbSslEnabledEnv === "" &&
+      /rds\.amazonaws\.com$/i.test(dbHost) &&
+      !TEST_MODE
+    ) {
       dbSslEnabled = true;
+    }
+
+    if (TEST_MODE) {
+      console.warn(`[INIT] Brand[${i}] TEST MODE ENABLED: SSL explicitly disabled.`);
     }
 
     const dbSslCa = process.env[`DB_SSL_CA_${i}`] || process.env.DB_SSL_CA;
@@ -169,7 +182,7 @@ function loadBrands() {
       waitForConnections: true,
       connectionLimit: 5,
       queueLimit: 0,
-      ...(ssl ? { ssl } : {}),
+      ...(ssl && !TEST_MODE ? { ssl } : {}),
     });
 
     brands.push({
@@ -230,14 +243,28 @@ async function ensureTablesForBrand(brand) {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
+    // Check for product_type in MV.
+    const [mvCols] = await conn.query(`SHOW COLUMNS FROM mv_product_sessions_by_type_daily LIKE 'product_type'`);
+    if (mvCols.length === 0) {
+      console.log(`[${brand.name}] Updating mv_product_sessions_by_type_daily schema (ADD column + Update PK)...`);
+      try {
+        await conn.query(`ALTER TABLE mv_product_sessions_by_type_daily ADD COLUMN product_type VARCHAR(255) NOT NULL DEFAULT 'Unknown' AFTER landing_page_type`);
+        await conn.query(`ALTER TABLE mv_product_sessions_by_type_daily DROP PRIMARY KEY, ADD PRIMARY KEY (date, landing_page_type, product_type)`);
+      } catch (err) {
+        console.warn(`[${brand.name}] Schema update warning (might have partially run or PK issue): ${err.message}`);
+        // If generic ALTER fails, we might technically need manual intervention or just let it crash, but listing it here is safer.
+      }
+    }
+
     await conn.query(`
       CREATE TABLE IF NOT EXISTS mv_product_sessions_by_type_daily (
         date DATE NOT NULL,
         landing_page_type VARCHAR(100) NOT NULL,
+        product_type VARCHAR(255) NOT NULL DEFAULT 'Unknown',
         sessions INT NOT NULL DEFAULT 0,
         sessions_with_cart_additions INT NOT NULL DEFAULT 0,
         add_to_cart_rate DECIMAL(6,4) NOT NULL DEFAULT 0,
-        PRIMARY KEY (date, landing_page_type),
+        PRIMARY KEY (date, landing_page_type, product_type),
         KEY idx_type (landing_page_type)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
@@ -274,6 +301,13 @@ async function ensureTablesForBrand(brand) {
         KEY idx_last_synced_at (last_synced_at)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    // Check for product_type column and add if missing
+    const [cols] = await conn.query(`SHOW COLUMNS FROM product_landing_mapping LIKE 'product_type'`);
+    if (cols.length === 0) {
+      console.log(`[${brand.name}] 'product_type' column missing in product_landing_mapping. Adding it...`);
+      await conn.query(`ALTER TABLE product_landing_mapping ADD COLUMN product_type VARCHAR(255) NULL AFTER title`);
+    }
 
     // Note: includes landing_page_path because your INSERT uses it
     await conn.query(`
@@ -357,7 +391,7 @@ async function syncProductsForBrand(brand) {
 
   const conn = await brand.pool.getConnection();
   try {
-    let url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/products.json?limit=250&fields=id,title,status,handle`;
+    let url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/products.json?limit=250&fields=id,title,status,handle,product_type`;
     let page = 1;
     let total = 0;
 
@@ -387,18 +421,25 @@ async function syncProductsForBrand(brand) {
       const products = resp.data.products || [];
       if (!products.length) break;
 
-      const rows = products.map((p) => [p.id, `/products/${p.handle}`, p.status || null, p.title || null]);
+      const rows = products.map((p) => [
+        p.id,
+        `/products/${p.handle}`,
+        p.status || null,
+        p.title || null,
+        p.product_type || null
+      ]);
 
       if (rows.length) {
-        const placeholders = rows.map(() => "(?, ?, ?, ?)").join(", ");
+        const placeholders = rows.map(() => "(?, ?, ?, ?, ?)").join(", ");
         await conn.query(
           `
-          INSERT INTO product_landing_mapping (product_id, landing_page_path, status, title)
+          INSERT INTO product_landing_mapping (product_id, landing_page_path, status, title, product_type)
           VALUES ${placeholders}
           ON DUPLICATE KEY UPDATE
             product_id=VALUES(product_id),
             status=VALUES(status),
             title=VALUES(title),
+            product_type=VALUES(product_type),
             last_synced_at=CURRENT_TIMESTAMP
         `,
           rows.flat()
@@ -523,12 +564,20 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
       continue;
     }
 
-    if (resp.status !== 200 || resp.data.errors) return [];
+    if (resp.status !== 200 || resp.data.errors) {
+      console.error(`[${brand.tag}] ShopifyQL Fetch Failed: ${resp.status}`, resp.data.errors);
+      return [];
+    }
 
     const res = resp.data.data?.shopifyqlQuery;
-    if (!res || res.parseErrors?.length) return [];
+    if (!res || res.parseErrors?.length) {
+      console.error(`[${brand.tag}] ShopifyQL Parse Errors:`, res?.parseErrors);
+      return [];
+    }
 
-    return formatShopifyQLTable(res.tableData);
+    const formatted = formatShopifyQLTable(res.tableData);
+    console.log(`[${brand.tag}] ShopifyQL fetched ${formatted.length} rows.`);
+    return formatted;
   }
 }
 
@@ -597,7 +646,7 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
 
     const insertRows = rows.map((r) => [
       targetYmd,
-      r.landing_page_type || null,
+      r.landing_page_type || "Unknown",
       r.landing_page_path || null,
       r.utm_source || null,
       r.utm_medium || null,
@@ -653,18 +702,25 @@ async function refreshMaterializedViews(brand, targetYmd) {
     await conn.query(
       `
       INSERT INTO mv_product_sessions_by_type_daily
-      (date, landing_page_type, sessions, sessions_with_cart_additions, add_to_cart_rate)
+      (date, landing_page_type, product_type, sessions, sessions_with_cart_additions, add_to_cart_rate)
       SELECT
-        date,
-        landing_page_type,
-        SUM(sessions) AS sessions,
-        SUM(sessions_with_cart_additions) AS sessions_with_cart_additions,
-        CASE WHEN SUM(sessions) > 0
-             THEN ROUND(SUM(sessions_with_cart_additions) / SUM(sessions), 4)
+        s.date,
+        s.landing_page_type,
+        COALESCE(m.product_type, 'Unknown') AS product_type,
+        SUM(s.sessions) AS sessions,
+        SUM(s.sessions_with_cart_additions) AS sessions_with_cart_additions,
+        CASE WHEN SUM(s.sessions) > 0
+             THEN ROUND(SUM(s.sessions_with_cart_additions) / SUM(s.sessions), 4)
              ELSE 0 END AS add_to_cart_rate
-      FROM product_sessions_snapshot
-      WHERE date = ?
-      GROUP BY date, landing_page_type
+      FROM product_sessions_snapshot s
+      LEFT JOIN product_landing_mapping m
+        ON (
+          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
+        ) = (
+          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
+        )
+      WHERE s.date = ?
+      GROUP BY s.date, s.landing_page_type, product_type
     `,
       [targetYmd]
     );
@@ -704,7 +760,8 @@ async function refreshMaterializedViews(brand, targetYmd) {
 
         CASE
           WHEN SUM(s.sessions) > 0
-            THEN ROUND(COALESCE(o.orders, 0) / SUM(s.sessions) * 100, 4)
+            -- Use MAX(o.orders) to strictly comply with only_full_group_by since o.orders is aggregate per product
+            THEN ROUND(COALESCE(MAX(o.orders), 0) / SUM(s.sessions) * 100, 4)
           ELSE 0
         END AS conversion_rate_pct
 
@@ -772,7 +829,8 @@ async function refreshMaterializedViews(brand, targetYmd) {
 
         CASE
           WHEN SUM(s.sessions) > 0
-            THEN ROUND(COALESCE(o.orders, 0) / SUM(s.sessions) * 100, 4)
+             -- Use MAX(o.orders) for strict group by compliance
+            THEN ROUND(COALESCE(MAX(o.orders), 0) / SUM(s.sessions) * 100, 4)
           ELSE 0
         END AS conversion_rate_pct
 
@@ -812,7 +870,10 @@ async function refreshMaterializedViews(brand, targetYmd) {
       [targetYmd, targetYmd]
     );
 
-    console.log(`[${brand.name}] Refreshed MVs for ${targetYmd}`);
+    console.log(`[${brand.name}] Refreshed MVs for ${targetYmd} (Deleted old, inserted new).`);
+  } catch (err) {
+    console.error(`[${brand.name}] MV Refresh Error:`, err);
+    throw err;
   } finally {
     conn.release();
   }
@@ -858,7 +919,8 @@ async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
 
 // ---------- Pipeline per brand (date-aware) ----------
 async function processBrand(brand, targetYmd) {
-  console.log(`\n========== ${brand.tag} (${targetYmd}) ==========\n`);
+  const startTotal = Date.now();
+  console.log(`\n========== ${brand.tag} (${targetYmd}) START ==========\n`);
 
   await ensureTablesForBrand(brand);
 
@@ -882,7 +944,7 @@ async function processBrand(brand, targetYmd) {
   const hourly = await fetchShopifyQLHourlySessions(brand, targetYmd);
   await upsertHourlySessionsSummary(brand, hourly, targetYmd);
 
-  console.log(`[${brand.tag}] Pipeline complete for ${targetYmd}.`);
+  console.log(`[${brand.tag}] Pipeline complete for ${targetYmd}. Duration: ${(Date.now() - startTotal) / 1000}s`);
 }
 
 // ---------- Runners ----------
@@ -942,7 +1004,11 @@ async function safeRun(trigger = "unknown") {
 }
 
 // ---------- Main ----------
-if (import.meta.url === `file://${process.argv[1]}`) {
+console.log(`[DEBUG] Checking main module...`);
+console.log(`[DEBUG] import.meta.url: ${import.meta.url}`);
+console.log(`[DEBUG] process.argv[1]: ${process.argv[1]}`);
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (BACKFILL_MODE) {
     // Backfill once on startup; do NOT schedule hourly cron
     safeRun("backfill_startup");
@@ -962,4 +1028,24 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(`[SCHED] Cron enabled: runs at start of every hour (Asia/Kolkata).`);
     console.log(`[SCHED] Service started @ ${fmtIST()}`);
   }
+
+  // Generic Manual Triggering
+  const app = express();
+  const PORT = process.env.PORT || 8080;
+
+  app.post("/run-pipeline", (req, res) => {
+    console.log(`[SERVER] /run-pipeline triggered manually.`);
+    console.log(`[SERVER] Request IP: ${req.ip}`);
+
+    safeRun("manual_http"); // Fire and forget or wait? safeRun handles concurrency.
+    res.json({
+      status: "triggered",
+      message: "Pipeline trigger received. Check logs for progress.",
+      timestamp: fmtIST(),
+    });
+  });
+
+  app.listen(PORT, () => {
+    console.log(`[SERVER] HTTP server listening on port ${PORT}`);
+  });
 }
