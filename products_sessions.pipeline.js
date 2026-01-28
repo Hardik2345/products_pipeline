@@ -223,6 +223,7 @@ async function ensureTablesForBrand(brand) {
         date DATE NOT NULL,
         landing_page_type VARCHAR(100) NOT NULL,
         landing_page_path VARCHAR(500) NOT NULL,
+        product_id VARCHAR(50) DEFAULT NULL,
 
         utm_source   VARCHAR(255) NULL,
         utm_medium   VARCHAR(255) NULL,
@@ -239,9 +240,21 @@ async function ensureTablesForBrand(brand) {
         KEY idx_date_path (date, landing_page_path(200)),
         KEY idx_page_path (landing_page_path(200)),
         KEY idx_date_campaign (date, utm_campaign(100)),
-        KEY idx_date_referrer (date, referrer_name(100))
+        KEY idx_date_referrer (date, referrer_name(100)),
+        KEY idx_product_id (product_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    const [snapshotCols] = await conn.query(
+      `SHOW COLUMNS FROM product_sessions_snapshot LIKE 'product_id'`
+    );
+    if (snapshotCols.length === 0) {
+      console.log(`[${brand.name}] 'product_id' column missing in product_sessions_snapshot. Adding it...`);
+      await conn.query(
+        `ALTER TABLE product_sessions_snapshot ADD COLUMN product_id VARCHAR(50) NULL AFTER landing_page_path`
+      );
+      await conn.query(`ALTER TABLE product_sessions_snapshot ADD KEY idx_product_id (product_id)`);
+    }
 
     // Check for product_type in MV.
     const [mvCols] = await conn.query(`SHOW COLUMNS FROM mv_product_sessions_by_type_daily LIKE 'product_type'`);
@@ -681,6 +694,23 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
       VALUES ${placeholders}
     `,
       insertRows.flat()
+    );
+
+    await conn.query(
+      `
+      UPDATE product_sessions_snapshot s
+      JOIN product_landing_mapping m
+        ON (
+          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
+        ) = (
+          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
+        )
+      SET s.product_id = m.product_id
+      WHERE s.date = ?
+        AND s.product_id IS NULL
+        AND m.product_id IS NOT NULL
+    `,
+      [targetYmd]
     );
 
     console.log(`[${brand.name}] Inserted ${insertRows.length} rows into snapshot for ${targetYmd}.`);
