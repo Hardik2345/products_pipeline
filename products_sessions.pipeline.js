@@ -224,6 +224,7 @@ async function ensureTablesForBrand(brand) {
         landing_page_type VARCHAR(100) NOT NULL,
         landing_page_path VARCHAR(500) NOT NULL,
         product_id VARCHAR(50) DEFAULT NULL,
+        product_title VARCHAR(255) DEFAULT NULL,
 
         utm_source   VARCHAR(255) NULL,
         utm_medium   VARCHAR(255) NULL,
@@ -254,6 +255,18 @@ async function ensureTablesForBrand(brand) {
         `ALTER TABLE product_sessions_snapshot ADD COLUMN product_id VARCHAR(50) NULL AFTER landing_page_path`
       );
       await conn.query(`ALTER TABLE product_sessions_snapshot ADD KEY idx_product_id (product_id)`);
+    }
+
+    const [snapshotTitleCols] = await conn.query(
+      `SHOW COLUMNS FROM product_sessions_snapshot LIKE 'product_title'`
+    );
+    if (snapshotTitleCols.length === 0) {
+      console.log(
+        `[${brand.name}] 'product_title' column missing in product_sessions_snapshot. Adding it...`
+      );
+      await conn.query(
+        `ALTER TABLE product_sessions_snapshot ADD COLUMN product_title VARCHAR(255) NULL AFTER product_id`
+      );
     }
 
     // Check for product_type in MV.
@@ -661,6 +674,7 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
       targetYmd,
       r.landing_page_type || "Unknown",
       r.landing_page_path || null,
+      null,
       r.utm_source || null,
       r.utm_medium || null,
       r.utm_campaign || null,
@@ -672,7 +686,7 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
       new Date(),
     ]);
 
-    const placeholders = insertRows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+    const placeholders = insertRows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
 
     await conn.query(
       `
@@ -681,6 +695,7 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
         date,
         landing_page_type,
         landing_page_path,
+        product_title,
         utm_source,
         utm_medium,
         utm_campaign,
@@ -705,10 +720,11 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
         ) = (
           CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
         )
-      SET s.product_id = m.product_id
+      SET s.product_id = m.product_id,
+          s.product_title = m.title
       WHERE s.date = ?
-        AND s.product_id IS NULL
-        AND m.product_id IS NOT NULL
+        AND (s.product_id IS NULL OR s.product_title IS NULL)
+        AND (m.product_id IS NOT NULL OR m.title IS NOT NULL)
     `,
       [targetYmd]
     );
