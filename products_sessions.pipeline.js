@@ -9,6 +9,11 @@
  *   BACKFILL_START_IST_DATE=2025-10-01
  *   BACKFILL_END_IST_DATE=2025-12-14
  *
+ * Optional single-brand filter:
+ *   TARGET_BRAND_TAG=my_brand_tag
+ *   or
+ *   TARGET_BRAND_INDEX=0
+ *
  * Optional:
  *   SHOPIFYQL_TIMEZONE=Asia/Kolkata   (default)
  */
@@ -65,6 +70,11 @@ const BACKFILL_START_IST_DATE = (process.env.BACKFILL_START_IST_DATE || process.
 const BACKFILL_END_IST_DATE = (process.env.BACKFILL_END_IST_DATE || process.env.BACKFILL_END_IST || "").split("T")[0]; // YYYY-MM-DD
 const SHOPIFYQL_TIMEZONE = process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
 const TEST_MODE = process.env.TEST_MODE === "true";
+const TARGET_BRAND_TAG = (process.env.TARGET_BRAND_TAG || "").trim();
+const TARGET_BRAND_INDEX_RAW = (process.env.TARGET_BRAND_INDEX || "").trim();
+const TARGET_BRAND_INDEX =
+  TARGET_BRAND_INDEX_RAW === "" ? null : Number.parseInt(TARGET_BRAND_INDEX_RAW, 10);
+const SHOPIFYQL_MAX_RETRIES = Number.parseInt(process.env.SHOPIFYQL_MAX_RETRIES || "8", 10);
 
 // ---------- Date-range helpers (safe iteration using UTC) ----------
 function isValidYMD(s) {
@@ -112,6 +122,17 @@ function buildInclusiveDateRangeYMD(startYmd, endYmd) {
 function loadBrands() {
   const count = parseInt(process.env.TOTAL_CONFIG_COUNT || "0", 10);
   console.log(`[INIT] Loading ${count} brands...`);
+  if (TARGET_BRAND_TAG) {
+    console.log(`[INIT] TARGET_BRAND_TAG filter enabled: ${TARGET_BRAND_TAG}`);
+  }
+  if (TARGET_BRAND_INDEX_RAW !== "") {
+    if (Number.isNaN(TARGET_BRAND_INDEX)) {
+      throw new Error(
+        `[INIT] Invalid TARGET_BRAND_INDEX='${TARGET_BRAND_INDEX_RAW}'. Expected an integer.`
+      );
+    }
+    console.log(`[INIT] TARGET_BRAND_INDEX filter enabled: ${TARGET_BRAND_INDEX}`);
+  }
 
   const brands = [];
 
@@ -168,6 +189,9 @@ function loadBrands() {
 
     const brandTag = process.env[`BRAND_TAG_${i}`] || `brand_${i}`;
     const brandName = process.env[`BRAND_NAME_${i}`] || brandTag.toUpperCase();
+    const skipByIndex = TARGET_BRAND_INDEX !== null && i !== TARGET_BRAND_INDEX;
+    const skipByTag = TARGET_BRAND_TAG && brandTag !== TARGET_BRAND_TAG;
+    if (skipByIndex || skipByTag) continue;
 
     if (!shopName || !apiVersion || !accessToken || !dbHost || !dbUser || !dbDatabase) {
       console.warn(`[INIT] Skipping brand index ${i} – missing env(s).`);
@@ -198,6 +222,12 @@ function loadBrands() {
     });
 
     console.log(`[INIT] Brand[${i}] ${brandName} ready (shop=${shopName}, db=${dbDatabase})`);
+  }
+
+  if ((TARGET_BRAND_TAG || TARGET_BRAND_INDEX !== null) && brands.length === 0) {
+    throw new Error(
+      `[INIT] Brand filter applied but no matching brand configs were loaded. TARGET_BRAND_TAG='${TARGET_BRAND_TAG}', TARGET_BRAND_INDEX='${TARGET_BRAND_INDEX_RAW}'`
+    );
   }
 
   console.log(`[INIT] Active brands: ${brands.map((b) => `${b.index}:${b.name}`).join(", ")}`);
@@ -565,6 +595,22 @@ function buildShopifyQLQuery(targetYmd = null) {
   `.replace(/\n+/g, " ");
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getRetryDelaySeconds(resp, attempt) {
+  const retryAfter = Number(resp?.headers?.["retry-after"]);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter;
+  return Math.min(30, Math.max(2, 2 ** Math.max(0, attempt - 1)));
+}
+
+function isShopifyQLThrottled(resp) {
+  const errors = resp?.data?.errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some((e) => e?.extensions?.code === "THROTTLED");
+}
+
 async function fetchShopifyQLSessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
   const q = buildShopifyQLQuery(targetYmd).replace(/"/g, '\\"');
@@ -573,7 +619,7 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
     query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
   };
 
-  while (true) {
+  for (let attempt = 1; attempt <= SHOPIFYQL_MAX_RETRIES; attempt++) {
     const resp = await axios.post(url, graphql, {
       headers: {
         "Content-Type": "application/json",
@@ -583,10 +629,13 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
       validateStatus: () => true,
     });
 
-    if (resp.status === 429) {
-      const retry = Number(resp.headers["retry-after"] || "3");
-      console.log(`[${brand.tag}] ShopifyQL rate-limited, sleeping ${retry}s`);
-      await new Promise((r) => setTimeout(r, retry * 1000));
+    if (resp.status === 429 || isShopifyQLThrottled(resp)) {
+      if (attempt === SHOPIFYQL_MAX_RETRIES) break;
+      const retry = getRetryDelaySeconds(resp, attempt);
+      console.log(
+        `[${brand.tag}] ShopifyQL throttled (attempt ${attempt}/${SHOPIFYQL_MAX_RETRIES}), sleeping ${retry}s`
+      );
+      await sleep(retry * 1000);
       continue;
     }
 
@@ -605,6 +654,11 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
     console.log(`[${brand.tag}] ShopifyQL fetched ${formatted.length} rows.`);
     return formatted;
   }
+
+  console.error(
+    `[${brand.tag}] ShopifyQL throttled after ${SHOPIFYQL_MAX_RETRIES} attempts. Skipping ${targetYmd || "today"}.`
+  );
+  return [];
 }
 
 // ---------- Hourly ShopifyQL (hour_of_day) ----------
@@ -636,7 +690,7 @@ async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
     query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
   };
 
-  while (true) {
+  for (let attempt = 1; attempt <= SHOPIFYQL_MAX_RETRIES; attempt++) {
     const resp = await axios.post(url, graphql, {
       headers: {
         "Content-Type": "application/json",
@@ -646,20 +700,34 @@ async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
       validateStatus: () => true,
     });
 
-    if (resp.status === 429) {
-      const retry = Number(resp.headers["retry-after"] || "3");
-      console.log(`[${brand.tag}] ShopifyQL hourly rate-limited, sleeping ${retry}s`);
-      await new Promise((r) => setTimeout(r, retry * 1000));
+    if (resp.status === 429 || isShopifyQLThrottled(resp)) {
+      if (attempt === SHOPIFYQL_MAX_RETRIES) break;
+      const retry = getRetryDelaySeconds(resp, attempt);
+      console.log(
+        `[${brand.tag}] ShopifyQL hourly throttled (attempt ${attempt}/${SHOPIFYQL_MAX_RETRIES}), sleeping ${retry}s`
+      );
+      await sleep(retry * 1000);
       continue;
     }
 
-    if (resp.status !== 200 || resp.data.errors) return [];
+    if (resp.status !== 200 || resp.data.errors) {
+      console.error(`[${brand.tag}] ShopifyQL Hourly Fetch Failed: ${resp.status}`, resp.data.errors);
+      return [];
+    }
 
     const res = resp.data.data?.shopifyqlQuery;
-    if (!res || res.parseErrors?.length) return [];
+    if (!res || res.parseErrors?.length) {
+      console.error(`[${brand.tag}] ShopifyQL Hourly Parse Errors:`, res?.parseErrors);
+      return [];
+    }
 
     return formatShopifyQLTable(res.tableData);
   }
+
+  console.error(
+    `[${brand.tag}] ShopifyQL hourly throttled after ${SHOPIFYQL_MAX_RETRIES} attempts. Skipping ${targetYmd || "today"}.`
+  );
+  return [];
 }
 
 // ---------- Snapshot + MV refresh ----------
