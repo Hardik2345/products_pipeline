@@ -559,9 +559,11 @@ function buildDayClause(targetYmd) {
   return `SINCE ${targetYmd}T00:00:00 UNTIL ${targetYmd}T23:59:59`;
 }
 
-function buildShopifyQLQuery(targetYmd = null) {
+function buildShopifyQLQuery(targetYmd = null, offset = 0) {
   const dayClause = buildDayClause(targetYmd);
   const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+  const pageClause =
+    offset > 0 ? `LIMIT 1000 { OFFSET ${offset} }` : `LIMIT 1000`;
 
   return `
     FROM sessions
@@ -590,7 +592,7 @@ function buildShopifyQLQuery(targetYmd = null) {
       ${tzClause}
       ${dayClause}
       ORDER BY sessions DESC
-      LIMIT 1000
+      ${pageClause}
     VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
   `.replace(/\n+/g, " ");
 }
@@ -612,53 +614,77 @@ function isShopifyQLThrottled(resp) {
 }
 
 async function fetchShopifyQLSessions(brand, targetYmd = null) {
-  const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
-  const q = buildShopifyQLQuery(targetYmd).replace(/"/g, '\\"');
+  const allRows = [];
+  let offset = 0;
+  const pageSize = 1000;
 
-  const graphql = {
-    query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
-  };
+  while (true) {
+    const q = buildShopifyQLQuery(targetYmd, offset).replace(/"/g, '\\"');
+    const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
+    const graphql = {
+      query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
+    };
 
-  for (let attempt = 1; attempt <= SHOPIFYQL_MAX_RETRIES; attempt++) {
-    const resp = await axios.post(url, graphql, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": brand.accessToken,
-      },
-      timeout: 60000,
-      validateStatus: () => true,
-    });
+    let pageRows = [];
+    let success = false;
 
-    if (resp.status === 429 || isShopifyQLThrottled(resp)) {
-      if (attempt === SHOPIFYQL_MAX_RETRIES) break;
-      const retry = getRetryDelaySeconds(resp, attempt);
-      console.log(
-        `[${brand.tag}] ShopifyQL throttled (attempt ${attempt}/${SHOPIFYQL_MAX_RETRIES}), sleeping ${retry}s`
+    for (let attempt = 1; attempt <= SHOPIFYQL_MAX_RETRIES; attempt++) {
+      const resp = await axios.post(url, graphql, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": brand.accessToken,
+        },
+        timeout: 60000,
+        validateStatus: () => true,
+      });
+
+      if (resp.status === 429 || isShopifyQLThrottled(resp)) {
+        if (attempt === SHOPIFYQL_MAX_RETRIES) break;
+        const retry = getRetryDelaySeconds(resp, attempt);
+        console.log(
+          `[${brand.tag}] ShopifyQL throttled (offset=${offset}, attempt ${attempt}/${SHOPIFYQL_MAX_RETRIES}), sleeping ${retry}s`
+        );
+        await sleep(retry * 1000);
+        continue;
+      }
+
+      if (resp.status !== 200 || resp.data.errors) {
+        console.error(
+          `[${brand.tag}] ShopifyQL Fetch Failed (offset=${offset}): ${resp.status}`,
+          resp.data.errors
+        );
+        break; // Stop fetching more pages if one fails
+      }
+
+      const res = resp.data.data?.shopifyqlQuery;
+      if (!res || res.parseErrors?.length) {
+        console.error(`[${brand.tag}] ShopifyQL Parse Errors (offset=${offset}):`, res?.parseErrors);
+        break;
+      }
+
+      pageRows = formatShopifyQLTable(res.tableData);
+      success = true;
+      break;
+    }
+
+    if (!success) {
+      console.error(
+        `[${brand.tag}] Failed to fetch page at offset ${offset}. Returning partial data.`
       );
-      await sleep(retry * 1000);
-      continue;
+      break;
     }
 
-    if (resp.status !== 200 || resp.data.errors) {
-      console.error(`[${brand.tag}] ShopifyQL Fetch Failed: ${resp.status}`, resp.data.errors);
-      return [];
-    }
+    allRows.push(...pageRows);
+    console.log(`[${brand.tag}] ShopifyQL fetched ${pageRows.length} rows (offset ${offset}).`);
 
-    const res = resp.data.data?.shopifyqlQuery;
-    if (!res || res.parseErrors?.length) {
-      console.error(`[${brand.tag}] ShopifyQL Parse Errors:`, res?.parseErrors);
-      return [];
+    if (pageRows.length < pageSize) {
+      break; // No more data
     }
-
-    const formatted = formatShopifyQLTable(res.tableData);
-    console.log(`[${brand.tag}] ShopifyQL fetched ${formatted.length} rows.`);
-    return formatted;
+    offset += pageSize;
   }
 
-  console.error(
-    `[${brand.tag}] ShopifyQL throttled after ${SHOPIFYQL_MAX_RETRIES} attempts. Skipping ${targetYmd || "today"}.`
-  );
-  return [];
+  console.log(`[${brand.tag}] Total ShopifyQL sessions fetched: ${allRows.length}.`);
+  return allRows;
 }
 
 // ---------- Hourly ShopifyQL (hour_of_day) ----------
