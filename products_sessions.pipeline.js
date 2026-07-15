@@ -75,6 +75,14 @@ const TARGET_BRAND_INDEX_RAW = (process.env.TARGET_BRAND_INDEX || "").trim();
 const TARGET_BRAND_INDEX =
   TARGET_BRAND_INDEX_RAW === "" ? null : Number.parseInt(TARGET_BRAND_INDEX_RAW, 10);
 const SHOPIFYQL_MAX_RETRIES = Number.parseInt(process.env.SHOPIFYQL_MAX_RETRIES || "8", 10);
+// Pagination controls for the main sessions query. Shopify caps a single
+// ShopifyQL response at 1000 rows, so we page through with LIMIT/OFFSET to
+// avoid dropping the long tail of (page × UTM) combinations.
+const SHOPIFYQL_PAGE_SIZE = Number.parseInt(process.env.SHOPIFYQL_PAGE_SIZE || "1000", 10);
+// Safety ceiling so a runaway / unstable pagination can't loop forever.
+const SHOPIFYQL_MAX_PAGES = Number.parseInt(process.env.SHOPIFYQL_MAX_PAGES || "50", 10);
+// Polite pause between pages to stay under ShopifyQL's cost-based throttle.
+const SHOPIFYQL_PAGE_DELAY_MS = Number.parseInt(process.env.SHOPIFYQL_PAGE_DELAY_MS || "750", 10);
 
 // ---------- Date-range helpers (safe iteration using UTC) ----------
 function isValidYMD(s) {
@@ -563,7 +571,9 @@ function buildShopifyQLQuery(targetYmd = null, offset = 0) {
   const dayClause = buildDayClause(targetYmd);
   const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
   const pageClause =
-    offset > 0 ? `LIMIT 1000 { OFFSET ${offset} }` : `LIMIT 1000`;
+    offset > 0
+      ? `LIMIT ${SHOPIFYQL_PAGE_SIZE} OFFSET ${offset}`
+      : `LIMIT ${SHOPIFYQL_PAGE_SIZE}`;
 
   return `
     FROM sessions
@@ -591,7 +601,7 @@ function buildShopifyQLQuery(targetYmd = null, offset = 0) {
         referrer_name
       ${tzClause}
       ${dayClause}
-      ORDER BY sessions DESC
+      ORDER BY sessions DESC, landing_page_path, utm_source, utm_medium, utm_campaign, utm_content, utm_term, referrer_name
       ${pageClause}
     VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
   `.replace(/\n+/g, " ");
@@ -613,20 +623,25 @@ function isShopifyQLThrottled(resp) {
   return errors.some((e) => e?.extensions?.code === "THROTTLED");
 }
 
+// Pages through the sessions result set with LIMIT/OFFSET so the daily 1000-row
+// cap can't drop the long tail. Returns { ok, rows }:
+//   ok=true  → complete result set; safe to overwrite the day's snapshot.
+//   ok=false → a page failed or we hit the page ceiling; caller MUST NOT
+//              overwrite, otherwise we'd replace a complete day with a
+//              truncated one (the very bug this function fixes).
 async function fetchShopifyQLSessions(brand, targetYmd = null) {
   const allRows = [];
   let offset = 0;
-  const pageSize = 1000;
 
-  while (true) {
+  for (let page = 1; page <= SHOPIFYQL_MAX_PAGES; page++) {
     const q = buildShopifyQLQuery(targetYmd, offset).replace(/"/g, '\\"');
     const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
     const graphql = {
       query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
     };
 
-    let pageRows = [];
-    let success = false;
+    // null = hard failure on this page; [] = a genuinely empty page.
+    let pageRows = null;
 
     for (let attempt = 1; attempt <= SHOPIFYQL_MAX_RETRIES; attempt++) {
       const resp = await axios.post(url, graphql, {
@@ -653,7 +668,7 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
           `[${brand.tag}] ShopifyQL Fetch Failed (offset=${offset}): ${resp.status}`,
           resp.data.errors
         );
-        break; // Stop fetching more pages if one fails
+        break;
       }
 
       const res = resp.data.data?.shopifyqlQuery;
@@ -663,28 +678,41 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
       }
 
       pageRows = formatShopifyQLTable(res.tableData);
-      success = true;
       break;
     }
 
-    if (!success) {
+    // Hard failure → abort as incomplete so the caller keeps the existing day.
+    if (pageRows === null) {
       console.error(
-        `[${brand.tag}] Failed to fetch page at offset ${offset}. Returning partial data.`
+        `[${brand.tag}] Aborting ShopifyQL fetch for ${targetYmd || "today"} at offset ${offset}; snapshot will NOT be overwritten.`
       );
-      break;
+      return { ok: false, rows: allRows };
     }
 
     allRows.push(...pageRows);
-    console.log(`[${brand.tag}] ShopifyQL fetched ${pageRows.length} rows (offset ${offset}).`);
+    console.log(
+      `[${brand.tag}] ShopifyQL page ${page} (offset ${offset}) → ${pageRows.length} rows (running total ${allRows.length}).`
+    );
 
-    if (pageRows.length < pageSize) {
-      break; // No more data
+    // A short page means we've reached the end of the result set.
+    if (pageRows.length < SHOPIFYQL_PAGE_SIZE) {
+      console.log(
+        `[${brand.tag}] ShopifyQL pagination complete for ${targetYmd || "today"}: ${allRows.length} rows across ${page} page(s).`
+      );
+      return { ok: true, rows: allRows };
     }
-    offset += pageSize;
+
+    offset += SHOPIFYQL_PAGE_SIZE;
+    // Polite pause between pages so we stay under the cost-based throttle.
+    if (page < SHOPIFYQL_MAX_PAGES) await sleep(SHOPIFYQL_PAGE_DELAY_MS);
   }
 
-  console.log(`[${brand.tag}] Total ShopifyQL sessions fetched: ${allRows.length}.`);
-  return allRows;
+  // Never saw a short page → more data likely remains (or ordering is
+  // unstable). Treat as incomplete rather than silently truncating.
+  console.error(
+    `[${brand.tag}] ShopifyQL hit SHOPIFYQL_MAX_PAGES=${SHOPIFYQL_MAX_PAGES} for ${targetYmd || "today"} without reaching the final page. Treating as incomplete; snapshot will NOT be overwritten.`
+  );
+  return { ok: false, rows: allRows };
 }
 
 // ---------- Hourly ShopifyQL (hour_of_day) ----------
@@ -1075,10 +1103,17 @@ async function processBrand(brand, targetYmd) {
     console.log(`[${brand.tag}] Product sync already done today (${realToday}), skipping.`);
   }
 
-  // Main sessions snapshot + MVs
-  const rows = await fetchShopifyQLSessions(brand, targetYmd);
-  await upsertProductSessionsSnapshot(brand, rows, targetYmd);
-  await refreshMaterializedViews(brand, targetYmd);
+  // Main sessions snapshot + MVs. Skip the upsert on an incomplete fetch so a
+  // partial/truncated result never overwrites a previously complete day.
+  const sessions = await fetchShopifyQLSessions(brand, targetYmd);
+  if (sessions.ok) {
+    await upsertProductSessionsSnapshot(brand, sessions.rows, targetYmd);
+    await refreshMaterializedViews(brand, targetYmd);
+  } else {
+    console.error(
+      `[${brand.tag}] Skipping snapshot + MV refresh for ${targetYmd}: session fetch was incomplete. Existing data left intact.`
+    );
+  }
 
   // Hourly summary
   const hourly = await fetchShopifyQLHourlySessions(brand, targetYmd);
